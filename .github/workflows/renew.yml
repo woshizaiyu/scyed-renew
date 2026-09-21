@@ -1,0 +1,63 @@
+name: Auto Renew Scyed
+
+on:
+  schedule:
+    - cron: '0 10,18 * * *' # 每天UTC 10点/18点（北京时间18点/次日2点），间隔8小时天然避开1小时续期冷却
+  workflow_dispatch:
+
+jobs:
+  Renew-scyed:
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: ⚙ 设置 Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: 🛠️ 安装依赖
+        run: pip install requests
+
+      - name: ⚙ 设置代理 (sing-box，CF 403 必备)
+        continue-on-error: true
+        env:
+          NODE_LINK: ${{ secrets.NODE_LINK }}
+        run: |
+          bash <(wget -qO- https://main.ssss.nyc.mn/setup_proxy.sh)
+
+      - name: 🚀 运行续期脚本（纯 HTTP，无浏览器）
+        env:
+          SCYED_COOKIE: ${{ secrets.SCYED_COOKIE }}
+          SCYED_SERVER_IDS: ${{ secrets.SCYED_SERVER_IDS }}
+          NEXT_ACTION: ${{ secrets.NEXT_ACTION }}
+          SCYED_PROXY: ${{ secrets.SCYED_PROXY }}
+          EMAIL: ${{ secrets.EMAIL }}
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+        run: python3 app.py
+
+      - name: 🧽 清理进程和临时文件
+        if: always()
+        run: |
+          pkill -f sing-box || true
+          rm -f sing-box sing-box-config.json sing-box.log
+
+      - name: 🧹 清理旧的工作流运行记录
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          runs=$(gh run list --workflow="${{ github.workflow }}" --limit=100 --json databaseId --jq '.[].databaseId')
+          count=0
+          for run_id in $runs; do
+            count=$((count + 1))
+            if [ $count -gt 1 ]; then
+              echo "删除运行记录: $run_id"
+              gh run delete $run_id || true
+            fi
+          done
