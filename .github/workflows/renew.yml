@@ -21,7 +21,7 @@ jobs:
           python-version: '3.12'
 
       - name: 🛠️ 安装依赖
-        run: pip install requests
+        run: pip install "requests[socks]"
 
       - name: ⚙ 设置代理 (sing-box，CF 403 必备)
         continue-on-error: true
