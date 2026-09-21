@@ -333,6 +333,8 @@ def browser_login(sb, cookie_raw, server_id) -> bool:
 
 RENEW_BUTTON_SELECTORS = [
     'button:contains("Extend for Free")',  # 实测英文站精确文本，优先
+    'button:contains("Kostenlos verlängern")',  # 实测德文站精确文本（注意小写v）
+    'button:contains("verlängern")',  # 小写兜底（contains 大小写敏感）
     'button:contains("免费延期")',
     'button:contains("Verlängern")',
     'button:contains("Verlängerung")',
@@ -340,6 +342,10 @@ RENEW_BUTTON_SELECTORS = [
     'button:contains("Renew")',
     'button:contains("Prolonger")',
 ]
+
+# 续期已满的报错关键词 → 视为已拉满（ok），不是失败
+FULL_KEYWORDS = ("maximum", "maximal", "bereits", "already", "limit",
+                 "voll", "erreicht", "schon verlängert")
 
 
 def find_renew_button(sb, timeout=30):
@@ -425,6 +431,10 @@ def renew_one_server(sb, cookie_raw, server_id) -> dict:
     cd = has_cooldown(new_text)
     if cd:
         result.update(ok=True, summary=f"⏳ 冷却中（{cd}），下次 cron 再续", new=old_raw)
+        return result
+    low = (new_text or "").lower()
+    if any(k in low for k in FULL_KEYWORDS):
+        result.update(ok=True, summary="✅ 已拉满（面板提示已达上限，无需再续）", new=old_raw)
         return result
     new_raw, new_dt = extract_expiry(new_text)
     if old_dt and new_dt and new_dt > old_dt:
