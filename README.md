@@ -5,7 +5,7 @@
 ### 原理
 
 - `POST /de/gameserver/{ID}/upgrade/freeServer?extend=30`（`next-action` 头 + Cookie），成功后 GET 回页面抓德语日期（`Neues Ablaufdatum`）验+30 天。
-- **哈希自动探测**：每次从升级页 HTML 正则捞 40 位候选逐个试（404 即换，Secrets 的 `NEXT_ACTION` 优先试一次），站改版无需手动更新；探测全灭才告警人工抓包。
+- **哈希自动探测**：每次从升级页 HTML + 其引用的同站 JS 包里正则捞 40 位候选逐个试（404 即换，Secrets 的 `NEXT_ACTION` 优先试一次），站改版无需手动更新；探测全灭才告警人工抓包。
 - 三态：成功 / 冷却中（`wait X hour`，ok 上报，下次 cron 再续）/ 失败（401/403 即 Cookie 失效告警）。
 - 站点有 Cloudflare，直连 403，必须挂代理（sing-box）。
 

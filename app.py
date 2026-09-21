@@ -353,15 +353,40 @@ def fetch_page(cookies: dict, server_id: str):
         return "", f"GET 异常: {e}"
 
 
-def discover_next_actions(text: str):
-    """从页面 HTML 里捞 40 位 hex 候选（Next.js action 哈希），去重保序，上限 20。"""
+def discover_next_actions(cookies: dict, server_id: str, page_text: str):
+    """两级探测：①页面 HTML 内联 40 位 hex；②页面引用的同站 JS 包逐个下载再捞。
+    去重保序，上限 30 个。"""
     seen, out = set(), []
-    for m in re.findall(r"\b[0-9a-f]{40}\b", text or ""):
-        if m not in seen:
-            seen.add(m)
-            out.append(m)
-        if len(out) >= 20:
-            break
+
+    def _collect(text):
+        for m in re.findall(r"\b[0-9a-f]{40}\b", text or ""):
+            if m not in seen:
+                seen.add(m)
+                out.append(m)
+            if len(out) >= 30:
+                return True
+        return False
+
+    if _collect(page_text):
+        return out
+    # 二级：扒 <script src> 同站 JS
+    js_urls = []
+    for m in re.findall(r'<script[^>]+src="([^"]+)"', page_text or ""):
+        src = m.replace("&amp;", "&")
+        full = urllib.parse.urljoin(BASE_URL + "/", src)
+        if urllib.parse.urlsplit(full).netloc.endswith("scyed.com"):
+            js_urls.append(full)
+    js_urls = js_urls[:15]
+    print(f"🔍 HTML 无命中，扒 {len(js_urls)} 个 JS 包…")
+    headers = {"user-agent": UA, "referer": renew_page_url(server_id)}
+    for u in js_urls:
+        try:
+            r = requests.get(u, headers=headers, cookies=cookies,
+                             timeout=TIMEOUT, proxies=PROXIES or None)
+            if r.status_code == 200 and _collect(r.text):
+                break
+        except Exception:
+            continue
     return out
 
 
@@ -374,7 +399,7 @@ def renew_server(cookies: dict, server_id: str) -> dict:
     else:
         old_raw, old_dt = extract_expiry(text)
         print(f"📅 旧到期: {old_raw or '（未提取到）'}")
-        found = discover_next_actions(text)
+        found = discover_next_actions(cookies, server_id, text)
         print(f"🔍 自动探测到 {len(found)} 个候选哈希")
     # Secrets 的优先试一次，其次探测到的（去重）
     candidates = ([NEXT_ACTION] if NEXT_ACTION else []) + \
