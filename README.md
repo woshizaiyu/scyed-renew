@@ -5,6 +5,7 @@
 ### 原理
 
 - `POST /de/gameserver/{ID}/upgrade/freeServer?extend=30`（`next-action` 头 + Cookie），成功后 GET 回页面抓德语日期（`Neues Ablaufdatum`）验+30 天。
+- **哈希自动探测**：每次从升级页 HTML 正则捞 40 位候选逐个试（404 即换，Secrets 的 `NEXT_ACTION` 优先试一次），站改版无需手动更新；探测全灭才告警人工抓包。
 - 三态：成功 / 冷却中（`wait X hour`，ok 上报，下次 cron 再续）/ 失败（401/403 即 Cookie 失效告警）。
 - 站点有 Cloudflare，直连 403，必须挂代理（sing-box）。
 
@@ -16,7 +17,7 @@
 | SCYED_SERVER_IDS  | ✅ 必填  | 服务器 ID（面板 URL 里那段，如 `f8f9d4fa`；多服逗号分隔） |
 | DISCORD_TOKEN     | ❌ 可选* | Discord Token；*配了则 Cookie 401/403 时自动 OAuth 重登并回写，实现免维护 |
 | GH_TOKEN          | ❌ 可选  | GitHub classic PAT（重登成功后自动回写 `SCYED_COOKIE` 用，需与 DISCORD_TOKEN 同配） |
-| NEXT_ACTION       | ❌ 可选  | Server Action 哈希（默认内置，站改版失效时更新；持续失败会被告警提示） |
+| NEXT_ACTION       | ❌ 可选  | 手动指定的哈希（优先试一次）；不填则纯自动探测 |
 | NODE_LINK         | ✅ 必填* | 代理链接（vless/vmess/…），*除非配了 `SCYED_PROXY` |
 | SCYED_PROXY       | ❌ 可选  | 显式代理（如 `http://127.0.0.1:7890`），优先级最高 |
 | EMAIL             | ❌ 可选  | 通知备注名（脱敏显示） |

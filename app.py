@@ -293,14 +293,14 @@ def renew_page_url(server_id: str) -> str:
     return f"{BASE_URL}/de/gameserver/{server_id}/upgrade/freeServer?extend=30"
 
 
-def do_renew_once(cookies: dict, server_id: str):
-    """单次 POST 续期。返回 (status, info)：success / cooling / failed + 说明。"""
+def post_renew(cookies: dict, server_id: str, action: str):
+    """单次 POST。返回 (http_status, body)。"""
     url = renew_page_url(server_id)
     headers = {
         "accept": "text/x-component",
         "accept-language": "zh-CN,zh;q=0.9",
         "content-type": "text/plain;charset=UTF-8",
-        "next-action": NEXT_ACTION,
+        "next-action": action,
         "origin": BASE_URL,
         "referer": url,
         "user-agent": UA,
@@ -309,61 +309,94 @@ def do_renew_once(cookies: dict, server_id: str):
         r = requests.post(url, headers=headers, cookies=cookies,
                           data=json.dumps([server_id]),
                           timeout=TIMEOUT, proxies=PROXIES or None)
+        return r.status_code, r.text or ""
     except Exception as e:
-        return "failed", f"POST 异常: {e}"
-    body = r.text or ""
-    print(f"📡 POST renew → HTTP {r.status_code}")
-    if r.status_code == 403:
-        return "failed", "403 Forbidden：Cookie 失效或被 CF 拦截，请重拷 COOKIE / 检查代理"
-    if r.status_code == 401:
-        return "failed", "401：Cookie 已失效，请重拷 COOKIE"
-    if r.status_code != 200:
-        return "failed", f"HTTP {r.status_code}: {body[:200]}"
-    cd = has_cooldown(body)
-    if cd:
-        return "cooling", cd
-    return "success", body
+        return -1, f"POST 异常: {e}"
 
 
-def fetch_expiry(cookies: dict, server_id: str):
-    """GET 升级页抓到期时间。返回 (原文, datetime|None, err)。"""
+def do_renew_once(cookies: dict, server_id: str, candidates):
+    """逐个试哈希：404 换下一个；401/403 直接失败；200 则判冷却/成功。
+    返回 (status, info)：success / cooling / failed + 说明。"""
+    tried = 0
+    for action in candidates:
+        tried += 1
+        st, body = post_renew(cookies, server_id, action)
+        print(f"📡 POST renew [{action[:8]}…] → HTTP {st}")
+        if st == -1:
+            return "failed", body
+        if st == 404:
+            continue  # 哈希不对，换下一个（404 无副作用）
+        if st == 403:
+            return "failed", "403 Forbidden：Cookie 失效或被 CF 拦截，请重拷 COOKIE / 检查代理"
+        if st == 401:
+            return "failed", "401：Cookie 已失效，请重拷 COOKIE"
+        if st != 200:
+            return "failed", f"HTTP {st}: {body[:200]}"
+        cd = has_cooldown(body)
+        if cd:
+            return "cooling", cd
+        return "success", body
+    return "failed", f"全部 {tried} 个哈希均 404（自动探测失效，请按 README 手抓更新 NEXT_ACTION）"
+
+
+def fetch_page(cookies: dict, server_id: str):
+    """GET 升级页。返回 (text, err)。"""
     headers = {"accept": "text/html,*/*;q=0.8", "user-agent": UA,
                "referer": f"{BASE_URL}/de/gameserver/{server_id}/upgrade"}
     try:
         r = requests.get(renew_page_url(server_id), headers=headers,
                          cookies=cookies, timeout=TIMEOUT, proxies=PROXIES or None)
         if r.status_code != 200:
-            return "", None, f"GET {r.status_code}"
-        return (*extract_expiry(r.text), "")
+            return "", f"GET {r.status_code}"
+        return r.text or "", ""
     except Exception as e:
-        return "", None, f"GET 异常: {e}"
+        return "", f"GET 异常: {e}"
+
+
+def discover_next_actions(text: str):
+    """从页面 HTML 里捞 40 位 hex 候选（Next.js action 哈希），去重保序，上限 20。"""
+    seen, out = set(), []
+    for m in re.findall(r"\b[0-9a-f]{40}\b", text or ""):
+        if m not in seen:
+            seen.add(m)
+            out.append(m)
+        if len(out) >= 20:
+            break
+    return out
 
 
 def renew_server(cookies: dict, server_id: str) -> dict:
-    """完整流程：先 GET 记旧日期 → POST → 冷却即停 → GET 验新日期。"""
-    old_raw, old_dt, err = fetch_expiry(cookies, server_id)
+    """完整流程：GET 记旧日期+捞哈希候选 → 逐个 POST → 冷却即停 → GET 验新日期。"""
+    text, err = fetch_page(cookies, server_id)
     if err:
-        print(f"⚠️ 旧日期抓取失败: {err}（继续 POST，用回包判定）")
+        print(f"⚠️ 升级页抓取失败: {err}（继续 POST，用回包判定）")
+        old_raw, old_dt, found = "", None, []
     else:
+        old_raw, old_dt = extract_expiry(text)
         print(f"📅 旧到期: {old_raw or '（未提取到）'}")
+        found = discover_next_actions(text)
+        print(f"🔍 自动探测到 {len(found)} 个候选哈希")
+    # Secrets 的优先试一次，其次探测到的（去重）
+    candidates = ([NEXT_ACTION] if NEXT_ACTION else []) + \
+                 [c for c in found if c != NEXT_ACTION]
+    if not candidates:
+        return {"ok": False, "summary": "续期失败: 页面无候选哈希且未配 NEXT_ACTION",
+                "old": old_raw, "new": ""}
 
-    st, info = do_renew_once(cookies, server_id)
+    st, info = do_renew_once(cookies, server_id, candidates)
     if st == "cooling":
         return {"ok": True, "summary": f"⏳ 冷却中（{info}），下次 cron 再续",
                 "old": old_raw, "new": old_raw}
     if st == "failed":
-        # 疑似 next-action 失效：200 以外且非 401/403 时提示检查哈希
-        extra = ""
-        if not info.startswith(("403", "401")) and "HTTP" in info:
-            extra = "（若持续出现，可能是 next-action 哈希失效，需更新 NEXT_ACTION）"
-        return {"ok": False, "summary": f"续期失败: {info}{extra}",
+        return {"ok": False, "summary": f"续期失败: {info}",
                 "old": old_raw, "new": ""}
 
     time.sleep(5)
-    new_raw, new_dt, err2 = fetch_expiry(cookies, server_id)
+    text2, err2 = fetch_page(cookies, server_id)
     if err2:
         return {"ok": True, "summary": "✅ POST 成功，但新日期抓取失败，请人工核对",
                 "old": old_raw, "new": "（请人工核对）"}
+    new_raw, new_dt = extract_expiry(text2)
     if old_dt and new_dt and new_dt > old_dt:
         gain = (new_dt - old_dt).days
         return {"ok": True, "summary": f"✅ 续期成功（+{gain}天）",
@@ -391,7 +424,7 @@ def main():
         print("⚠️ COOKIE 里没找到 session_token，登录态可能无效，继续尝试…")
     print(f"📋 {len(server_ids)} 台服：{', '.join(server_ids)}")
     print(f"🔗 代理：{'已配置' if PROXIES else '直连'}")
-    print(f"🔑 next-action：{NEXT_ACTION[:8]}…（{'默认' if NEXT_ACTION == DEFAULT_NEXT_ACTION else '自定义'}）")
+    print(f"🔑 next-action：Secrets 优先 + 页面自动探测（站改版自适应）")
 
     results = []
     for sid in server_ids:
