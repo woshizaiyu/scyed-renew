@@ -2,7 +2,7 @@ name: Auto Renew Scyed
 
 on:
   schedule:
-    - cron: '0 10,18 * * *' # 每天UTC 10点/18点（北京时间18点/次日2点），间隔8小时天然避开1小时续期冷却
+    - cron: '0 7 20 * *' # 每天UTC 10点/18点（北京时间18点/次日2点），间隔8小时天然避开1小时续期冷却
   workflow_dispatch:
 
 jobs:
