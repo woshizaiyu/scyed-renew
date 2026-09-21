@@ -1,61 +1,43 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# Scyed 免费服自动续期（纯 HTTP，单账号单服，一次 +30 天）
-# 接口基于 jacksun-king/Scyed-Renew，通知/告警按自家标准重做
-# 流程：Cookie + next-action 头 POST 续期 → GET 回页面抓德语日期验成功
+# Scyed 免费服自动续期（浏览器点击版，单账号，一次 +30 天）
+# 主链：SeleniumBase 注入 Cookie → 打开续期页 → 点免费延期按钮 → toast/日期验成功
+# 备链：Cookie 401/登录失效时，用 DISCORD_TOKEN 走纯 HTTP OAuth 重登并回写
 # Secrets（密钥只进 Secrets，永不落盘）：
 #   SCYED_COOKIE     必填，scyed.com 的 Cookie 串（至少含 __Secure-better-auth.session_token，约7天命）
-#   SCYED_SERVER_IDS 必填，服务器 ID（面板 URL 里那段，如 f8f9d4fa；多服逗号分隔）
-#   DISCORD_TOKEN    可选，Discord Token；Cookie 401/403 时自动走 OAuth 重登并回写 SCYED_COOKIE
-#   GH_TOKEN         可选，GitHub classic PAT（重登成功后自动回写 SCYED_COOKIE 用）
-#   NEXT_ACTION      可选，Next.js Server Action 哈希（默认内置，站改版失效时更新此项）
+#   SCYED_SERVER_IDS 必填，服务器 ID（如 f8f9d4fa；多服逗号分隔）
+#   DISCORD_TOKEN    可选，Discord Token；登录失效时自动 OAuth 重登并回写
+#   GH_TOKEN         可选，GitHub classic PAT（回写 SCYED_COOKIE 用）
 #   EMAIL            可选，通知备注名
-#   NODE_LINK        可选，代理链接（CF 403 必须挂代理）
-#   TG_BOT_TOKEN / TG_CHAT_ID 可选，通知用
+#   NODE_LINK        可选，代理链接（sing-box，站有 CF）
+#   TG_BOT_TOKEN / TG_CHAT_ID 可选，通知用（含截图）
 
 import os, re, sys, time, json, subprocess, requests
 import urllib.parse
 from datetime import datetime, timezone, timedelta
+from seleniumbase import SB
 
 BASE_URL = "https://scyed.com"
-# jacksun 实测有效的 next-action；站改版后若失效，用 Secrets 的 NEXT_ACTION 覆盖
-DEFAULT_NEXT_ACTION = "40e3b5155f7802d90d31a92e262afcf125cf630a5f"
-NEXT_ACTION = os.environ.get("NEXT_ACTION") or DEFAULT_NEXT_ACTION
-
 COOKIE_RAW = os.environ.get("SCYED_COOKIE") or ""
 IDS_RAW    = os.environ.get("SCYED_SERVER_IDS") or ""
 DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN") or ""
 GH_TOKEN   = os.environ.get("GH_TOKEN") or ""
 EMAIL      = os.environ.get("EMAIL") or ""
-NODE_LINK  = os.environ.get("NODE_LINK") or ""
 TG_CHAT_ID   = os.environ.get("TG_CHAT_ID") or ""
 TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN") or ""
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36")
 TIMEOUT = 30
-
-# 代理：显式 SCYED_PROXY > workflow 的 IS_PROXY/PROXY_SERVER > 标准 HTTP(S)_PROXY
-PROXIES = {}
-_ep = os.environ.get("SCYED_PROXY") or ""
-if _ep:
-    PROXIES = {"http": _ep, "https": _ep}
-elif os.environ.get("IS_PROXY", "false").lower() == "true":
-    _p = os.environ.get("PROXY_SERVER", "").strip() or "http://127.0.0.1:1080"
-    PROXIES = {"http": _p, "https": _p}
-else:
-    _h = os.environ.get("HTTP_PROXY") or os.environ.get("http_proxy") or ""
-    _s = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy") or ""
-    if _h or _s:
-        PROXIES = {"http": _h, "https": _s or _h}
+DOMAIN = "scyed.com"
+SESSION_COOKIE_NAME = "__Secure-better-auth.session_token"
 
 # 冷却文案关键词 → 视为"未到窗口"，不算失败
 COOLDOWN_KEYWORDS = ("wait", "hour", "extension failed", "extending again",
                      "too soon", "cooldown", "try again later")
-
-
-def log(msg):
-    print(msg, flush=True)
+# 成功 toast 关键词（多语言）
+SUCCESS_KEYWORDS = ("erfolg", "success", "成功", "erweitert", "extended",
+                    "verlängert", "renewed", "neues ablaufdatum")
 
 
 def mask_email(email: str) -> str:
@@ -71,11 +53,31 @@ def send_telegram_message(message: str):
         return
     try:
         requests.post(f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage",
-                      json={"chat_id": TG_CHAT_ID, "text": message},
-                      timeout=10, proxies=PROXIES or None)
-        print("✅ Telegram 通知已发送")
+                      json={"chat_id": TG_CHAT_ID, "text": message}, timeout=10)
+        print("✅ Telegram 文字通知已发送")
     except Exception as e:
         print(f"❌ Telegram 发送失败: {e}")
+
+
+def send_telegram_photo(message: str, image_path: str):
+    if not TG_BOT_TOKEN or not TG_CHAT_ID:
+        print("⚠️ Telegram 未配置，跳过通知")
+        return
+    try:
+        if image_path and os.path.isfile(image_path):
+            with open(image_path, "rb") as f:
+                r = requests.post(
+                    f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendPhoto",
+                    data={"chat_id": TG_CHAT_ID, "caption": message[:1000]},
+                    files={"photo": (os.path.basename(image_path), f, "image/png")},
+                    timeout=20)
+            if r.status_code == 200:
+                print("✅ Telegram 截图通知已发送")
+                return
+            print(f"⚠️ sendPhoto 失败({r.status_code})，降级为文字通知")
+    except Exception as e:
+        print(f"⚠️ 截图通知异常，降级为文字通知: {e}")
+    send_telegram_message(message)
 
 
 def format_notification(status: str, server_id: str = "", old: str = "",
@@ -111,20 +113,82 @@ def parse_cookie_str(raw: str):
     return pairs
 
 
-# ---------- Discord OAuth 自动重登（Cookie 401/403 时启用） ----------
-# 链路：POST /api/auth/sign-in/social 取 Discord 授权 URL（client_id/state 由站方下发，
-# 无需事先知道）→ 用 DISCORD_TOKEN 调 Discord API 授权 → 回调 URL 经 requests 跟随，
-# 从 Set-Cookie 捕获新的 __Secure-better-auth.session_token → 回写 SCYED_COOKIE。
+def get_current_ip(proxy_server: str = "") -> str:
+    proxies = {"http": proxy_server, "https": proxy_server} if proxy_server else None
+    r = requests.get("https://api.ip.sb/ip", proxies=proxies, timeout=15)
+    r.raise_for_status()
+    return r.text.strip()
+
+
+GERMAN_MONTHS = ["Januar", "Februar", "März", "April", "Mai", "Juni",
+                 "Juli", "August", "September", "Oktober", "November", "Dezember"]
+
+
+def normalize_german_date(s: str):
+    mmap = {m.lower(): i + 1 for i, m in enumerate(GERMAN_MONTHS)}
+    m = re.search(r"(\d{1,2})\.\s*([A-Za-zäöüÄÖÜ]+)\s+(\d{4})(?:\s*um\s*(\d{1,2}):(\d{2}))?",
+                  (s or "").strip())
+    if not m:
+        return (s or "").strip(), None
+    mon = mmap.get(m.group(2).strip().lower())
+    if not mon:
+        return s.strip(), None
+    try:
+        dt = datetime(int(m.group(3)), mon, int(m.group(1)),
+                      int(m.group(4) or 0), int(m.group(5) or 0))
+    except ValueError:
+        return s.strip(), None
+    return dt.strftime("%Y-%m-%d %H:%M"), dt
+
+
+def extract_expiry(text: str):
+    for pattern in (r"Neues Ablaufdatum[^<]*?>\s*([^<]+?)\s*<",
+                    r"Läuft ab am[^<]*?>\s*([^<]+?)\s*<",
+                    r"Ablaufdatum[^<]*?>\s*([^<]+?)\s*<"):
+        m = re.search(pattern, text or "", re.IGNORECASE)
+        if m and m.group(1).strip():
+            return normalize_german_date(m.group(1))
+    m = re.search(r"\d{1,2}\.\s*(?:Januar|Februar|März|Mai|Juni|Juli|August|September|"
+                  r"Oktober|November|Dezember)\s+\d{4}(?:\s*um\s*\d{1,2}:\d{2})?",
+                  text or "", re.IGNORECASE)
+    if m:
+        return normalize_german_date(m.group(0))
+    # 中文翻译页兜底：2026年10月21日 / 2026年11月20日 12:01
+    m = re.search(r"(\d{4})年(\d{1,2})月(\d{1,2})日(?:\s*(\d{1,2}):(\d{2}))?", text or "")
+    if m:
+        try:
+            dt = datetime(int(m.group(1)), int(m.group(2)), int(m.group(3)),
+                          int(m.group(4) or 0), int(m.group(5) or 0))
+            return dt.strftime("%Y-%m-%d %H:%M"), dt
+        except ValueError:
+            pass
+    return "", None
+
+
+def has_cooldown(text: str) -> str:
+    low = (text or "").lower()
+    if "wait" in low and "hour" in low:
+        m = re.search(r"wait\s+\d+\s+more\s+hours?.{0,40}", text, re.IGNORECASE)
+        return m.group(0).strip() if m else "Extension cooldown"
+    if "extension failed" in low:
+        return "Extension Failed"
+    return ""
+
+
+def has_success(text: str) -> bool:
+    low = (text or "").lower()
+    return any(k in low for k in SUCCESS_KEYWORDS)
+
+
+# ---------- Discord OAuth 自动重登（备链，纯 HTTP） ----------
 
 DISCORD_API = "https://discord.com/api/v9/oauth2/authorize"
 DISCORD_UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
               "(KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36")
-SESSION_COOKIE_NAME = "__Secure-better-auth.session_token"
 
 
 def update_github_secret(secret_name, new_value):
     if not new_value:
-        print(f"⚠️ 跳过更新 {secret_name}：新值为空")
         return False
     print(f"🔄 更新 Secret: {secret_name}（长度 {len(new_value)}）")
     try:
@@ -144,13 +208,10 @@ def update_github_secret(secret_name, new_value):
 
 
 def parse_dc_token(raw: str) -> str:
-    if not raw:
-        return ""
-    return raw.split(",", 1)[-1].strip()
+    return raw.split(",", 1)[-1].strip() if raw else ""
 
 
-def signin_social_url():
-    """调 better-auth 取 Discord 授权 URL。返回 (authorize_url, err)。"""
+def signin_social_url(proxies):
     try:
         r = requests.post(f"{BASE_URL}/api/auth/sign-in/social",
                           json={"provider": "discord", "callbackURL": "/",
@@ -159,20 +220,16 @@ def signin_social_url():
                           headers={"Content-Type": "application/json",
                                    "Origin": BASE_URL, "Referer": f"{BASE_URL}/",
                                    "User-Agent": UA},
-                          timeout=TIMEOUT, proxies=PROXIES or None)
+                          timeout=TIMEOUT, proxies=proxies or None)
         if r.status_code != 200:
             return "", f"sign-in/social HTTP {r.status_code}: {r.text[:200]}"
-        data = r.json()
-        url = data.get("url", "")
-        if not url:
-            return "", f"响应无 url 字段: {str(data)[:200]}"
-        return url, ""
+        url = r.json().get("url", "")
+        return (url, "") if url else ("", f"响应无 url 字段: {str(r.json())[:200]}")
     except Exception as e:
         return "", f"sign-in/social 异常: {e}"
 
 
-def discord_authorize(authorize_url: str, dc_token: str) -> str:
-    """用 Discord Token 授权，返回站方 callback URL（含 code+state）。"""
+def discord_authorize(authorize_url: str, dc_token: str, proxies) -> str:
     try:
         q = dict(urllib.parse.parse_qsl(urllib.parse.urlsplit(authorize_url).query))
         referer = "https://discord.com/oauth2/authorize?" + urllib.parse.urlencode({
@@ -187,39 +244,34 @@ def discord_authorize(authorize_url: str, dc_token: str) -> str:
                            "location_context": {"guild_id": "10000", "channel_id": "10000",
                                                 "channel_type": 10000}})
         resp = requests.post(authorize_url, headers=headers, data=body,
-                             timeout=20, proxies=PROXIES or None)
+                             timeout=20, proxies=proxies or None)
         if resp.status_code != 200:
             print(f"❌ Discord 授权失败: HTTP {resp.status_code} - {resp.text[:200]}")
             return ""
         location = resp.json().get("location", "")
         if location:
             print("✅ Discord 授权成功，拿到 callback URL")
-        else:
-            print(f"❌ 授权响应无 location: {str(resp.json())[:200]}")
         return location
     except Exception as e:
         print(f"❌ Discord 授权异常: {e}")
         return ""
 
 
-def do_oauth_relogin(old_raw: str):
-    """完整重登。返回 (new_cookie_raw, err)，失败 new 为空。"""
+def do_oauth_relogin(old_raw: str, proxies):
     dc_token = parse_dc_token(DISCORD_TOKEN)
     if not dc_token:
         return "", "未配置 DISCORD_TOKEN"
     print("🔑 Cookie 失效，走 Discord OAuth 重登...")
-    authorize_url, err = signin_social_url()
-    if not authorize_url:
-        return "", err
-    if "discord.com" not in authorize_url:
-        return "", f"授权 URL 异常: {authorize_url[:120]}"
-    location = discord_authorize(authorize_url, dc_token)
+    authorize_url, err = signin_social_url(proxies)
+    if not authorize_url or "discord.com" not in authorize_url:
+        return "", err or f"授权 URL 异常: {authorize_url[:120]}"
+    location = discord_authorize(authorize_url, dc_token, proxies)
     if not location or "scyed.com" not in location:
         return "", "Discord 授权未返回站方 callback"
     try:
         s = requests.Session()
         s.headers.update({"User-Agent": UA})
-        r = s.get(location, timeout=TIMEOUT, proxies=PROXIES or None)
+        r = s.get(location, timeout=TIMEOUT, proxies=proxies or None)
         print(f"📡 callback → HTTP {r.status_code}")
         token = s.cookies.get(SESSION_COOKIE_NAME, domain="scyed.com") or ""
         if not token:
@@ -240,256 +292,204 @@ def do_oauth_relogin(old_raw: str):
         return "", f"callback 异常: {e}"
 
 
-GERMAN_MONTHS = ["Januar", "Februar", "März", "April", "Mai", "Juni",
-                 "Juli", "August", "September", "Oktober", "November", "Dezember"]
-
-
-def normalize_german_date(s: str) -> str:
-    """10. Oktober 2026 um 10:20 → 2026-10-10 10:20，顺带返回可比较的 datetime。"""
-    mmap = {m.lower(): i + 1 for i, m in enumerate(GERMAN_MONTHS)}
-    m = re.search(r"(\d{1,2})\.\s*([A-Za-zäöüÄÖÜ]+)\s+(\d{4})(?:\s*um\s*(\d{1,2}):(\d{2}))?",
-                  (s or "").strip())
-    if not m:
-        return (s or "").strip(), None
-    mon = mmap.get(m.group(2).strip().lower())
-    if not mon:
-        return s.strip(), None
-    try:
-        dt = datetime(int(m.group(3)), mon, int(m.group(1)),
-                      int(m.group(4) or 0), int(m.group(5) or 0))
-    except ValueError:
-        return s.strip(), None
-    return dt.strftime("%Y-%m-%d %H:%M"), dt
-
-
-def extract_expiry(text: str):
-    """从升级页 HTML 提到期时间。返回 (原文, datetime|None)。优先 Neues Ablaufdatum。"""
-    for pattern in (r"Neues Ablaufdatum[^<]*?>\s*([^<]+?)\s*<",
-                    r"Läuft ab am[^<]*?>\s*([^<]+?)\s*<",
-                    r"Ablaufdatum[^<]*?>\s*([^<]+?)\s*<"):
-        m = re.search(pattern, text or "", re.IGNORECASE)
-        if m and m.group(1).strip():
-            return normalize_german_date(m.group(1))
-    m = re.search(r"\d{1,2}\.\s*(?:Januar|Februar|März|Mai|Juni|Juli|August|September|"
-                  r"Oktober|November|Dezember)\s+\d{4}(?:\s*um\s*\d{1,2}:\d{2})?",
-                  text or "", re.IGNORECASE)
-    if m:
-        return normalize_german_date(m.group(0))
-    return "", None
-
-
-def has_cooldown(text: str) -> str:
-    """检查冷却文案，命中返回原文片段，否则返回空串。"""
-    low = (text or "").lower()
-    if "wait" in low and "hour" in low:
-        m = re.search(r"wait\s+\d+\s+more\s+hours?.{0,40}", text, re.IGNORECASE)
-        return m.group(0).strip() if m else "Extension cooldown"
-    if "extension failed" in low:
-        return "Extension Failed"
-    return ""
-
+# ---------- 浏览器主链 ----------
 
 def renew_page_url(server_id: str) -> str:
     return f"{BASE_URL}/de/gameserver/{server_id}/upgrade/freeServer?extend=30"
 
 
-def post_renew(cookies: dict, server_id: str, action: str):
-    """单次 POST。返回 (http_status, body)。"""
-    url = renew_page_url(server_id)
-    headers = {
-        "accept": "text/x-component",
-        "accept-language": "zh-CN,zh;q=0.9",
-        "content-type": "text/plain;charset=UTF-8",
-        "next-action": action,
-        "origin": BASE_URL,
-        "referer": url,
-        "user-agent": UA,
-    }
-    try:
-        r = requests.post(url, headers=headers, cookies=cookies,
-                          data=json.dumps([server_id]),
-                          timeout=TIMEOUT, proxies=PROXIES or None)
-        return r.status_code, r.text or ""
-    except Exception as e:
-        return -1, f"POST 异常: {e}"
-
-
-def do_renew_once(cookies: dict, server_id: str, candidates):
-    """逐个试哈希：404 换下一个；401/403 直接失败；200 则判冷却/成功。
-    返回 (status, info)：success / cooling / failed + 说明。"""
-    tried = 0
-    for action in candidates:
-        tried += 1
-        st, body = post_renew(cookies, server_id, action)
-        print(f"📡 POST renew [{action[:8]}…] → HTTP {st}")
-        if st == -1:
-            return "failed", body
-        if st == 404:
-            continue  # 哈希不对，换下一个（404 无副作用）
-        if st == 403:
-            return "failed", "403 Forbidden：Cookie 失效或被 CF 拦截，请重拷 COOKIE / 检查代理"
-        if st == 401:
-            return "failed", "401：Cookie 已失效，请重拷 COOKIE"
-        if st != 200:
-            return "failed", f"HTTP {st}: {body[:200]}"
-        cd = has_cooldown(body)
-        if cd:
-            return "cooling", cd
-        return "success", body
-    return "failed", f"全部 {tried} 个哈希均 404（自动探测失效，请按 README 手抓更新 NEXT_ACTION）"
-
-
-def fetch_page(cookies: dict, server_id: str):
-    """GET 升级页。返回 (text, err)。"""
-    headers = {"accept": "text/html,*/*;q=0.8", "user-agent": UA,
-               "referer": f"{BASE_URL}/de/gameserver/{server_id}/upgrade"}
-    try:
-        r = requests.get(renew_page_url(server_id), headers=headers,
-                         cookies=cookies, timeout=TIMEOUT, proxies=PROXIES or None)
-        if r.status_code != 200:
-            return "", f"GET {r.status_code}"
-        return r.text or "", ""
-    except Exception as e:
-        return "", f"GET 异常: {e}"
-
-
-def discover_next_actions(cookies: dict, server_id: str, page_text: str):
-    """两级探测：①页面 HTML 内联 40 位 hex；②页面引用的同站 JS 包逐个下载再捞。
-    去重保序，上限 30 个。"""
-    seen, out = set(), []
-
-    def _collect(text):
-        for m in re.findall(r"\b[0-9a-f]{40}\b", text or ""):
-            if m not in seen:
-                seen.add(m)
-                out.append(m)
-            if len(out) >= 30:
-                return True
+def browser_login(sb, cookie_raw, server_id) -> bool:
+    pairs = parse_cookie_str(cookie_raw)
+    if not pairs:
+        print("❌ COOKIE 为空或格式错误")
         return False
-
-    if _collect(page_text):
-        return out
-    # 二级：扒 <script src> 同站 JS
-    js_urls = []
-    for m in re.findall(r'<script[^>]+src="([^"]+)"', page_text or ""):
-        src = m.replace("&amp;", "&")
-        full = urllib.parse.urljoin(BASE_URL + "/", src)
-        if urllib.parse.urlsplit(full).netloc.endswith("scyed.com"):
-            js_urls.append(full)
-    js_urls = js_urls[:15]
-    print(f"🔍 HTML 无命中，扒 {len(js_urls)} 个 JS 包…")
-    headers = {"user-agent": UA, "referer": renew_page_url(server_id)}
-    for u in js_urls:
+    sb.open(BASE_URL + "/")
+    sb.wait_for_ready_state_complete()
+    sb.sleep(2)
+    try:
+        sb.delete_all_cookies()
+    except Exception:
+        pass
+    for name, value in pairs:
         try:
-            r = requests.get(u, headers=headers, cookies=cookies,
-                             timeout=TIMEOUT, proxies=PROXIES or None)
-            if r.status_code == 200 and _collect(r.text):
-                break
+            sb.add_cookie({"name": name, "value": value, "domain": DOMAIN})
+        except Exception as e:
+            print(f"⚠️ 注入 Cookie {name} 失败: {e}")
+    sb.open(renew_page_url(server_id))
+    sb.wait_for_ready_state_complete()
+    sb.sleep(6)
+    try:
+        text = sb.get_text("body")
+    except Exception:
+        text = ""
+    url = sb.get_current_url()
+    if ("gameserver" in url and ("Ablaufdatum" in text or "Expiry" in text
+        or "到期" in text or "freeServer" in text or "Verlänger" in text)):
+        print("✅ Cookie 登录成功，已到达续期页")
+        return True
+    print(f"❌ Cookie 登录失败，URL={url}")
+    return False
+
+
+RENEW_BUTTON_SELECTORS = [
+    'button:contains("免费延期")',
+    'button:contains("Verlängern")',
+    'button:contains("Verlängerung")',
+    'button:contains("Extend")',
+    'button:contains("Renew")',
+    'button:contains("Prolonger")',
+]
+
+
+def find_renew_button(sb):
+    for sel in RENEW_BUTTON_SELECTORS:
+        try:
+            if sb.is_element_visible(sel):
+                t = sb.get_text(sel)
+                # 排除升级付费按钮
+                if any(k in t for k in ("付费", "Premium", "Upgrade", "升级", "Bezah")):
+                    continue
+                return sel, t.strip()
         except Exception:
             continue
-    return out
+    return None, ""
 
 
-def renew_server(cookies: dict, server_id: str) -> dict:
-    """完整流程：GET 记旧日期+捞哈希候选 → 逐个 POST → 冷却即停 → GET 验新日期。"""
-    text, err = fetch_page(cookies, server_id)
-    if err:
-        print(f"⚠️ 升级页抓取失败: {err}（继续 POST，用回包判定）")
-        old_raw, old_dt, found = "", None, []
-    else:
-        old_raw, old_dt = extract_expiry(text)
-        print(f"📅 旧到期: {old_raw or '（未提取到）'}")
-        found = discover_next_actions(cookies, server_id, text)
-        print(f"🔍 自动探测到 {len(found)} 个候选哈希")
-    # Secrets 的优先试一次，其次探测到的（去重）
-    candidates = ([NEXT_ACTION] if NEXT_ACTION else []) + \
-                 [c for c in found if c != NEXT_ACTION]
-    if not candidates:
-        return {"ok": False, "summary": "续期失败: 页面无候选哈希且未配 NEXT_ACTION",
-                "old": old_raw, "new": ""}
+def renew_one_server(sb, cookie_raw, server_id) -> dict:
+    result = {"ok": False, "summary": "未知", "old": "", "new": ""}
+    shot = f"result_{server_id}.png"
 
-    st, info = do_renew_once(cookies, server_id, candidates)
-    if st == "cooling":
-        return {"ok": True, "summary": f"⏳ 冷却中（{info}），下次 cron 再续",
-                "old": old_raw, "new": old_raw}
-    if st == "failed":
-        return {"ok": False, "summary": f"续期失败: {info}",
-                "old": old_raw, "new": ""}
+    if not browser_login(sb, cookie_raw, server_id):
+        result["summary"] = "❌ 登录失败（Cookie 失效）"
+        return result
 
-    time.sleep(5)
-    text2, err2 = fetch_page(cookies, server_id)
-    if err2:
-        return {"ok": True, "summary": "✅ POST 成功，但新日期抓取失败，请人工核对",
-                "old": old_raw, "new": "（请人工核对）"}
-    new_raw, new_dt = extract_expiry(text2)
+    try:
+        page_text = sb.get_text("body")
+    except Exception:
+        page_text = ""
+    old_raw, old_dt = extract_expiry(page_text)
+    print(f"📅 旧到期: {old_raw or '（未提取到）'}")
+    result["old"] = old_raw
+
+    sel, btn_text = find_renew_button(sb)
+    if not sel:
+        cd = has_cooldown(page_text)
+        if cd:
+            result.update(ok=True, summary=f"⏳ 冷却中（{cd}），下次 cron 再续", new=old_raw)
+            return result
+        result["summary"] = "ℹ️ 未找到续期按钮，请手动检查"
+        return result
+
+    print(f"✅ 发现续期按钮: '{btn_text}'，点击...")
+    try:
+        sb.click(sel)
+    except Exception:
+        try:
+            el = sb.find_element(sel)
+            sb.execute_script("arguments[0].click();", el)
+        except Exception as e:
+            result["summary"] = f"❌ 点击按钮失败: {e}"
+            return result
+    sb.sleep(8)
+    try:
+        new_text = sb.get_text("body")
+    except Exception:
+        new_text = ""
+    try:
+        sb.save_screenshot(shot)
+    except Exception:
+        shot = ""
+
+    cd = has_cooldown(new_text)
+    if cd:
+        result.update(ok=True, summary=f"⏳ 冷却中（{cd}），下次 cron 再续", new=old_raw)
+        return result
+    new_raw, new_dt = extract_expiry(new_text)
     if old_dt and new_dt and new_dt > old_dt:
         gain = (new_dt - old_dt).days
-        return {"ok": True, "summary": f"✅ 续期成功（+{gain}天）",
-                "old": old_raw, "new": new_raw}
-    if new_raw and new_raw != old_raw:
-        return {"ok": True, "summary": "✅ 续期成功（日期已变化）",
-                "old": old_raw, "new": new_raw}
-    return {"ok": True, "summary": "✅ POST 成功（日期未见变化，请人工核对）",
-            "old": old_raw, "new": new_raw or "（请人工核对）"}
+        result.update(ok=True, summary=f"✅ 续期成功（+{gain}天）", new=new_raw)
+    elif new_raw and new_raw != old_raw:
+        result.update(ok=True, summary="✅ 续期成功（日期已变化）", new=new_raw)
+    elif has_success(new_text):
+        result.update(ok=True, summary="✅ 续期成功（toast 确认）", new=new_raw or "（已确认）")
+    else:
+        result.update(summary="⚠️ 结果未知，请手动检查", new=new_raw)
+    result["shot"] = shot
+    return result
 
 
 def main():
     print("#" * 25)
-    print("   Scyed 自动续期（一次+30天）")
+    print("   Scyed 自动续期（浏览器点击版）")
     print("#" * 25)
-    if not COOKIE_RAW:
+    cookie_raw = (os.environ.get("SCYED_COOKIE") or "").strip()
+    if not cookie_raw:
         print("ℹ️ 未配置 SCYED_COOKIE，脚本终止。")
         sys.exit(1)
     server_ids = [s.strip() for s in IDS_RAW.split(",") if s.strip()]
     if not server_ids:
         print("ℹ️ 未配置 SCYED_SERVER_IDS，脚本终止。")
         sys.exit(1)
-    cookies = dict(parse_cookie_str(COOKIE_RAW))
-    if "__Secure-better-auth.session_token" not in cookies:
-        print("⚠️ COOKIE 里没找到 session_token，登录态可能无效，继续尝试…")
+
+    IS_PROXY = os.environ.get("IS_PROXY", "false").lower() == "true"
+    PROXY_SERVER = os.environ.get("PROXY_SERVER", "").strip() or "http://127.0.0.1:1080"
+    HEADLESS = os.environ.get("HEADLESS", "true").lower() == "true"
+    sb_kwargs = {"uc": True, "headless": HEADLESS}
+    proxies = None
+    if IS_PROXY:
+        print(f"🔗 挂载代理: {PROXY_SERVER}")
+        sb_kwargs["proxy"] = PROXY_SERVER
+        proxies = {"http": PROXY_SERVER, "https": PROXY_SERVER}
+    else:
+        print("🍭 未使用代理，直连访问")
     print(f"📋 {len(server_ids)} 台服：{', '.join(server_ids)}")
-    print(f"🔗 代理：{'已配置' if PROXIES else '直连'}")
-    print(f"🔑 next-action：Secrets 优先 + 页面自动探测（站改版自适应）")
 
     results = []
-    for sid in server_ids:
-        print(f"\n▶️ {sid}")
+    with SB(**sb_kwargs) as sb:
         try:
-            r = renew_server(cookies, sid)
+            print(f"📍 当前出口IP: {get_current_ip(PROXY_SERVER if IS_PROXY else '')}")
         except Exception as e:
-            import traceback
-            traceback.print_exc()
-            r = {"ok": False, "summary": f"执行异常：{e}", "old": "", "new": ""}
-        # 401/403 → OAuth 重登后重试一次（永久免维护的关键）
-        if (not r["ok"] and ("401" in r["summary"] or "403" in r["summary"])
-                and parse_dc_token(DISCORD_TOKEN)):
-            new_raw, err = do_oauth_relogin(COOKIE_RAW)
-            if new_raw:
-                if GH_TOKEN and update_github_secret("SCYED_COOKIE", new_raw):
-                    print("✅ SCYED_COOKIE 已回写")
+            print(f"⚠️ 获取出口 IP 失败: {e}")
+        for sid in server_ids:
+            print(f"\n▶️ {sid}")
+            try:
+                r = renew_one_server(sb, cookie_raw, sid)
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
+                r = {"ok": False, "summary": f"执行异常：{e}", "old": "", "new": ""}
+            # 登录失效 → OAuth 重登后整台重试一次
+            if (not r["ok"] and "登录失败" in r["summary"]
+                    and parse_dc_token(DISCORD_TOKEN)):
+                new_raw, err = do_oauth_relogin(cookie_raw, proxies)
+                if new_raw:
+                    if GH_TOKEN and update_github_secret("SCYED_COOKIE", new_raw):
+                        print("✅ SCYED_COOKIE 已回写")
+                    else:
+                        print("⚠️ 未配 GH_TOKEN，回写跳过")
+                    cookie_raw = new_raw
+                    try:
+                        try:
+                            sb.delete_all_cookies()
+                        except Exception:
+                            pass
+                        r = renew_one_server(sb, cookie_raw, sid)
+                        r["summary"] = "🔑 重登后" + r["summary"]
+                    except Exception as e:
+                        r = {"ok": False, "summary": f"重登后重试异常：{e}",
+                             "old": "", "new": ""}
                 else:
-                    print("⚠️ 未配 GH_TOKEN，回写跳过（本次用新 session 继续）")
-                    send_telegram_message(format_notification(
-                        "🔔 Cookie 已刷新", server_id=sid,
-                        extra="重登成功但未配 GH_TOKEN，请手动更新 SCYED_COOKIE"))
-                cookies = dict(parse_cookie_str(new_raw))
-                try:
-                    r = renew_server(cookies, sid)
-                    r["summary"] = "🔑 重登后" + r["summary"]
-                except Exception as e:
-                    r = {"ok": False, "summary": f"重登后重试异常：{e}",
-                         "old": "", "new": ""}
+                    r["summary"] += f"；重登失败（{err}），请手动重拷 COOKIE"
+            results.append((sid, r))
+            print(f"   {r['summary']}")
+            shot = r.get("shot", "")
+            if r["ok"]:
+                send_telegram_photo(format_notification(
+                    "✅ 续期成功" if "成功" in r["summary"] else "ℹ️ 续期状态",
+                    server_id=sid, old=r["old"], new=r["new"], extra=r["summary"]), shot)
             else:
-                r["summary"] += f"；重登失败（{err}），请手动重拷 COOKIE"
-        results.append((sid, r))
-        print(f"   {r['summary']}")
-        if r["ok"]:
-            send_telegram_message(format_notification(
-                "✅ 续期成功" if "成功" in r["summary"] else "ℹ️ 续期状态",
-                server_id=sid, old=r["old"], new=r["new"], extra=r["summary"]))
-        else:
-            send_telegram_message(format_notification(
-                "❌ 续期失败", server_id=sid, old=r["old"], error=r["summary"]))
+                send_telegram_message(format_notification(
+                    "❌ 续期失败", server_id=sid, old=r["old"], error=r["summary"]))
 
     ok_n = sum(1 for _, r in results if r["ok"])
     print(f"\n🏁 完成：{ok_n}/{len(results)} 成功")

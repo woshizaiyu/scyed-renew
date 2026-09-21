@@ -20,8 +20,12 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: 🛠️ 安装依赖
-        run: pip install "requests[socks]"
+      - name: 🛠️ 安装系统依赖和 Python 依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb x11-utils xdotool scrot fonts-noto-cjk jq wget
+          pip install seleniumbase requests
+          seleniumbase install chromedriver
 
       - name: ⚙ 设置代理 (sing-box，CF 403 必备)
         continue-on-error: true
@@ -30,24 +34,34 @@ jobs:
         run: |
           bash <(wget -qO- https://main.ssss.nyc.mn/setup_proxy.sh)
 
-      - name: 🚀 运行续期脚本（纯 HTTP，无浏览器）
+      - name: 🚀 运行续期脚本（浏览器点击）
         env:
           SCYED_COOKIE: ${{ secrets.SCYED_COOKIE }}
           SCYED_SERVER_IDS: ${{ secrets.SCYED_SERVER_IDS }}
           DISCORD_TOKEN: ${{ secrets.DISCORD_TOKEN }}
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
-          NEXT_ACTION: ${{ secrets.NEXT_ACTION }}
-          SCYED_PROXY: ${{ secrets.SCYED_PROXY }}
           EMAIL: ${{ secrets.EMAIL }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-        run: python3 app.py
+        run: |
+          xvfb-run --auto-servernum python3 app.py
+
+      - name: 📸 上传结果截图
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scyed-result
+          path: result_*.png
+          if-no-files-found: ignore
 
       - name: 🧽 清理进程和临时文件
         if: always()
         run: |
           pkill -f sing-box || true
-          rm -f sing-box sing-box-config.json sing-box.log
+          pkill -f chromedriver || true
+          pkill -f chrome || true
+          pkill -f Xvfb || true
+          rm -f sing-box sing-box-config.json sing-box.log result_*.png
 
       - name: 🧹 清理旧的工作流运行记录
         if: always()
