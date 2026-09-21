@@ -332,6 +332,7 @@ def browser_login(sb, cookie_raw, server_id) -> bool:
 
 
 RENEW_BUTTON_SELECTORS = [
+    'button:contains("Extend for Free")',  # 实测英文站精确文本，优先
     'button:contains("免费延期")',
     'button:contains("Verlängern")',
     'button:contains("Verlängerung")',
@@ -341,18 +342,38 @@ RENEW_BUTTON_SELECTORS = [
 ]
 
 
-def find_renew_button(sb):
-    for sel in RENEW_BUTTON_SELECTORS:
-        try:
-            if sb.is_element_visible(sel):
-                t = sb.get_text(sel)
-                # 排除升级付费按钮
-                if any(k in t for k in ("付费", "Premium", "Upgrade", "升级", "Bezah")):
-                    continue
-                return sel, t.strip()
-        except Exception:
-            continue
+def find_renew_button(sb, timeout=30):
+    """轮询找续期按钮（含客户端 hydration 等待）；找不到则返回 (None, '')。"""
+    start = time.time()
+    while time.time() - start < timeout:
+        for sel in RENEW_BUTTON_SELECTORS:
+            try:
+                if sb.is_element_visible(sel):
+                    t = sb.get_text(sel)
+                    # 排除升级付费按钮
+                    if any(k in t for k in ("付费", "Premium", "Upgrade", "升级", "Bezah")):
+                        continue
+                    return sel, t.strip()
+            except Exception:
+                continue
+        sb.sleep(2)
     return None, ""
+
+
+def log_all_buttons(sb):
+    """找不到按钮时打印全页按钮文本，下次加选择器用。"""
+    try:
+        texts = []
+        for el in sb.find_elements("button"):
+            try:
+                t = (el.text or "").strip().replace("\n", " ")
+                if t:
+                    texts.append(t)
+            except Exception:
+                pass
+        print(f"🔍 全页按钮文本: {texts}")
+    except Exception as e:
+        print(f"⚠️ 枚举按钮失败: {e}")
 
 
 def renew_one_server(sb, cookie_raw, server_id) -> dict:
@@ -377,6 +398,7 @@ def renew_one_server(sb, cookie_raw, server_id) -> dict:
         if cd:
             result.update(ok=True, summary=f"⏳ 冷却中（{cd}），下次 cron 再续", new=old_raw)
             return result
+        log_all_buttons(sb)
         result["summary"] = "ℹ️ 未找到续期按钮，请手动检查"
         return result
 
