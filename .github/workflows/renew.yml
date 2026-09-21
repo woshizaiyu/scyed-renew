@@ -34,6 +34,8 @@ jobs:
         env:
           SCYED_COOKIE: ${{ secrets.SCYED_COOKIE }}
           SCYED_SERVER_IDS: ${{ secrets.SCYED_SERVER_IDS }}
+          DISCORD_TOKEN: ${{ secrets.DISCORD_TOKEN }}
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
           NEXT_ACTION: ${{ secrets.NEXT_ACTION }}
           SCYED_PROXY: ${{ secrets.SCYED_PROXY }}
           EMAIL: ${{ secrets.EMAIL }}

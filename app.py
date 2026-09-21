@@ -6,12 +6,15 @@
 # Secrets（密钥只进 Secrets，永不落盘）：
 #   SCYED_COOKIE     必填，scyed.com 的 Cookie 串（至少含 __Secure-better-auth.session_token，约7天命）
 #   SCYED_SERVER_IDS 必填，服务器 ID（面板 URL 里那段，如 f8f9d4fa；多服逗号分隔）
+#   DISCORD_TOKEN    可选，Discord Token；Cookie 401/403 时自动走 OAuth 重登并回写 SCYED_COOKIE
+#   GH_TOKEN         可选，GitHub classic PAT（重登成功后自动回写 SCYED_COOKIE 用）
 #   NEXT_ACTION      可选，Next.js Server Action 哈希（默认内置，站改版失效时更新此项）
 #   EMAIL            可选，通知备注名
 #   NODE_LINK        可选，代理链接（CF 403 必须挂代理）
 #   TG_BOT_TOKEN / TG_CHAT_ID 可选，通知用
 
-import os, re, sys, time, json, requests
+import os, re, sys, time, json, subprocess, requests
+import urllib.parse
 from datetime import datetime, timezone, timedelta
 
 BASE_URL = "https://scyed.com"
@@ -21,6 +24,8 @@ NEXT_ACTION = os.environ.get("NEXT_ACTION") or DEFAULT_NEXT_ACTION
 
 COOKIE_RAW = os.environ.get("SCYED_COOKIE") or ""
 IDS_RAW    = os.environ.get("SCYED_SERVER_IDS") or ""
+DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN") or ""
+GH_TOKEN   = os.environ.get("GH_TOKEN") or ""
 EMAIL      = os.environ.get("EMAIL") or ""
 NODE_LINK  = os.environ.get("NODE_LINK") or ""
 TG_CHAT_ID   = os.environ.get("TG_CHAT_ID") or ""
@@ -104,6 +109,135 @@ def parse_cookie_str(raw: str):
         if name and value:
             pairs.append((name, value))
     return pairs
+
+
+# ---------- Discord OAuth 自动重登（Cookie 401/403 时启用） ----------
+# 链路：POST /api/auth/sign-in/social 取 Discord 授权 URL（client_id/state 由站方下发，
+# 无需事先知道）→ 用 DISCORD_TOKEN 调 Discord API 授权 → 回调 URL 经 requests 跟随，
+# 从 Set-Cookie 捕获新的 __Secure-better-auth.session_token → 回写 SCYED_COOKIE。
+
+DISCORD_API = "https://discord.com/api/v9/oauth2/authorize"
+DISCORD_UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+              "(KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36")
+SESSION_COOKIE_NAME = "__Secure-better-auth.session_token"
+
+
+def update_github_secret(secret_name, new_value):
+    if not new_value:
+        print(f"⚠️ 跳过更新 {secret_name}：新值为空")
+        return False
+    print(f"🔄 更新 Secret: {secret_name}（长度 {len(new_value)}）")
+    try:
+        env = os.environ.copy()
+        if GH_TOKEN:
+            env["GH_TOKEN"] = GH_TOKEN
+        proc = subprocess.run(["gh", "secret", "set", secret_name, "--body", new_value],
+                              capture_output=True, text=True, timeout=30,
+                              check=False, env=env)
+        if proc.returncode == 0:
+            return True
+        print(f"❌ 更新失败: {proc.stderr.strip()}")
+        return False
+    except Exception as e:
+        print(f"❌ 异常: {e}")
+        return False
+
+
+def parse_dc_token(raw: str) -> str:
+    if not raw:
+        return ""
+    return raw.split(",", 1)[-1].strip()
+
+
+def signin_social_url():
+    """调 better-auth 取 Discord 授权 URL。返回 (authorize_url, err)。"""
+    try:
+        r = requests.post(f"{BASE_URL}/api/auth/sign-in/social",
+                          json={"provider": "discord", "callbackURL": "/",
+                                "errorCallbackURL": "/sign-in",
+                                "newUserCallbackURL": "/"},
+                          headers={"Content-Type": "application/json",
+                                   "Origin": BASE_URL, "Referer": f"{BASE_URL}/",
+                                   "User-Agent": UA},
+                          timeout=TIMEOUT, proxies=PROXIES or None)
+        if r.status_code != 200:
+            return "", f"sign-in/social HTTP {r.status_code}: {r.text[:200]}"
+        data = r.json()
+        url = data.get("url", "")
+        if not url:
+            return "", f"响应无 url 字段: {str(data)[:200]}"
+        return url, ""
+    except Exception as e:
+        return "", f"sign-in/social 异常: {e}"
+
+
+def discord_authorize(authorize_url: str, dc_token: str) -> str:
+    """用 Discord Token 授权，返回站方 callback URL（含 code+state）。"""
+    try:
+        q = dict(urllib.parse.parse_qsl(urllib.parse.urlsplit(authorize_url).query))
+        referer = "https://discord.com/oauth2/authorize?" + urllib.parse.urlencode({
+            k: q[k] for k in ("client_id", "redirect_uri", "response_type", "scope", "state")
+            if k in q})
+        headers = {"accept": "*/*", "authorization": dc_token,
+                   "content-type": "application/json", "origin": "https://discord.com",
+                   "referer": referer, "user-agent": DISCORD_UA,
+                   "x-discord-locale": "zh-CN"}
+        body = json.dumps({"permissions": "0", "authorize": True,
+                           "integration_type": 0,
+                           "location_context": {"guild_id": "10000", "channel_id": "10000",
+                                                "channel_type": 10000}})
+        resp = requests.post(authorize_url, headers=headers, data=body,
+                             timeout=20, proxies=PROXIES or None)
+        if resp.status_code != 200:
+            print(f"❌ Discord 授权失败: HTTP {resp.status_code} - {resp.text[:200]}")
+            return ""
+        location = resp.json().get("location", "")
+        if location:
+            print("✅ Discord 授权成功，拿到 callback URL")
+        else:
+            print(f"❌ 授权响应无 location: {str(resp.json())[:200]}")
+        return location
+    except Exception as e:
+        print(f"❌ Discord 授权异常: {e}")
+        return ""
+
+
+def do_oauth_relogin(old_raw: str):
+    """完整重登。返回 (new_cookie_raw, err)，失败 new 为空。"""
+    dc_token = parse_dc_token(DISCORD_TOKEN)
+    if not dc_token:
+        return "", "未配置 DISCORD_TOKEN"
+    print("🔑 Cookie 失效，走 Discord OAuth 重登...")
+    authorize_url, err = signin_social_url()
+    if not authorize_url:
+        return "", err
+    if "discord.com" not in authorize_url:
+        return "", f"授权 URL 异常: {authorize_url[:120]}"
+    location = discord_authorize(authorize_url, dc_token)
+    if not location or "scyed.com" not in location:
+        return "", "Discord 授权未返回站方 callback"
+    try:
+        s = requests.Session()
+        s.headers.update({"User-Agent": UA})
+        r = s.get(location, timeout=TIMEOUT, proxies=PROXIES or None)
+        print(f"📡 callback → HTTP {r.status_code}")
+        token = s.cookies.get(SESSION_COOKIE_NAME, domain="scyed.com") or ""
+        if not token:
+            for c in s.cookies:
+                if "session_token" in c.name:
+                    token = c.value
+                    break
+        if not token:
+            return "", "callback 后未捕获到 session Cookie"
+        merged = dict(parse_cookie_str(old_raw))
+        merged[SESSION_COOKIE_NAME] = token
+        for c in s.cookies:
+            if c.value and c.name not in merged:
+                merged[c.name] = c.value
+        print("✅ 重登成功，拿到新 session")
+        return "; ".join(f"{k}={v}" for k, v in merged.items() if v), ""
+    except Exception as e:
+        return "", f"callback 异常: {e}"
 
 
 GERMAN_MONTHS = ["Januar", "Februar", "März", "April", "Mai", "Juni",
@@ -268,6 +402,27 @@ def main():
             import traceback
             traceback.print_exc()
             r = {"ok": False, "summary": f"执行异常：{e}", "old": "", "new": ""}
+        # 401/403 → OAuth 重登后重试一次（永久免维护的关键）
+        if (not r["ok"] and ("401" in r["summary"] or "403" in r["summary"])
+                and parse_dc_token(DISCORD_TOKEN)):
+            new_raw, err = do_oauth_relogin(COOKIE_RAW)
+            if new_raw:
+                if GH_TOKEN and update_github_secret("SCYED_COOKIE", new_raw):
+                    print("✅ SCYED_COOKIE 已回写")
+                else:
+                    print("⚠️ 未配 GH_TOKEN，回写跳过（本次用新 session 继续）")
+                    send_telegram_message(format_notification(
+                        "🔔 Cookie 已刷新", server_id=sid,
+                        extra="重登成功但未配 GH_TOKEN，请手动更新 SCYED_COOKIE"))
+                cookies = dict(parse_cookie_str(new_raw))
+                try:
+                    r = renew_server(cookies, sid)
+                    r["summary"] = "🔑 重登后" + r["summary"]
+                except Exception as e:
+                    r = {"ok": False, "summary": f"重登后重试异常：{e}",
+                         "old": "", "new": ""}
+            else:
+                r["summary"] += f"；重登失败（{err}），请手动重拷 COOKIE"
         results.append((sid, r))
         print(f"   {r['summary']}")
         if r["ok"]:

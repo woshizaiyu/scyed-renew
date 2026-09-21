@@ -14,6 +14,8 @@
 |-------------------|----------|------|
 | SCYED_COOKIE      | ✅ 必填  | scyed.com 的 Cookie 串（至少含 `__Secure-better-auth.session_token`，约 7 天命，Discord 登录） |
 | SCYED_SERVER_IDS  | ✅ 必填  | 服务器 ID（面板 URL 里那段，如 `f8f9d4fa`；多服逗号分隔） |
+| DISCORD_TOKEN     | ❌ 可选* | Discord Token；*配了则 Cookie 401/403 时自动 OAuth 重登并回写，实现免维护 |
+| GH_TOKEN          | ❌ 可选  | GitHub classic PAT（重登成功后自动回写 `SCYED_COOKIE` 用，需与 DISCORD_TOKEN 同配） |
 | NEXT_ACTION       | ❌ 可选  | Server Action 哈希（默认内置，站改版失效时更新；持续失败会被告警提示） |
 | NODE_LINK         | ✅ 必填* | 代理链接（vless/vmess/…），*除非配了 `SCYED_PROXY` |
 | SCYED_PROXY       | ❌ 可选  | 显式代理（如 `http://127.0.0.1:7890`），优先级最高 |
@@ -21,7 +23,8 @@
 | TG_BOT_TOKEN      | ❌ 可选  | Telegram Bot Token |
 | TG_CHAT_ID        | ❌ 可选  | Telegram Chat ID |
 
-> Cookie 获取：登录后 F12 → Application → Cookies → `scyed.com`，全选复制（`session_token` 保持原样）。7 天过期后 TG 会告警，重拷更新。
+> Cookie 获取：登录后 F12 → Application → Cookies → `scyed.com`，全选复制（`session_token` 保持原样）。
+> 免维护链：Cookie 401/403 → 用 `DISCORD_TOKEN` 走 OAuth 重登 → 新 session 回写 `SCYED_COOKIE`（需 `GH_TOKEN`）→ 重试续期。都没配则 TG 告警手动重拷。
 
 ### 部署步骤
 
